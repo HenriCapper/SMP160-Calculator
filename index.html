@@ -57,6 +57,8 @@ const SMP160_PS1 = [
   ];
   // Minimum allowed edge distance (mm). PS1 defines maximum only; we enforce a conservative minimum of 100 mm.
   const EDGE_MIN = 100;
+// Panel step size: 25 mm for stock mode, 0 for continuous widths in Standard mode.
+let PANEL_STEP = 25;
   /**
  * Look up the SMP160 PS1 row matching the given system ('pool' or 'balustrade'), glass thickness (string or number),
    * glass height (string or number) and wind zone code (L,M,H,VH,EH). Returns the closest height band if the exact
@@ -670,11 +672,26 @@ body > *:not(.container) img[src*="opus"] {
         <input id="cornerCount" type="hidden">
 
         <!-- mixed‐panel checkbox -->
-        <div style="grid-column:1/2">
+        <!-- Mixed panel checkbox: give it an id so it can be shown/hidden when switching glass modes -->
+        <div id="allowMixedContainer" style="grid-column:1/2">
           <label>
             <input type="checkbox" id="allowMixed">
             Allow mixed panel sizes (±200 mm)
           </label>
+        </div>
+        <!-- Glass Mode & Gap size selectors inserted for SMP160 (similar to SP10) -->
+        <div style="margin-top:0.5rem; display:flex; flex-wrap:wrap; gap:1rem; align-items:flex-end;">
+          <div style="min-width:140px;">
+            <label>Glass Mode</label>
+            <select id="glassType" style="width:100%;min-width:120px;">
+              <option value="standard" selected>Standard</option>
+              <option value="stock">Stock Sizes</option>
+            </select>
+          </div>
+          <div id="gapSelectContainer" style="min-width:140px;">
+            <label>Gap size (mm)</label>
+            <select id="gapSize" style="width:100%;min-width:120px;"></select>
+          </div>
         </div>
         <div>
       <!-- SMP160 spigot mode selector -->
@@ -1409,7 +1426,8 @@ function refreshSelectors() {
     const hr = $('handrailType').value;
     const fin = $('finishType').value;
     const fix = $('fixingType').value;
-    const allowMix = $('allowMixed').checked;
+    // allowMix will be determined based on glass mode (Standard vs Stock)
+    let allowMix;
     // SMP160: Extra packers are not applicable; set to zero to avoid null errors
     const extraPackers = 0;
 
@@ -1499,16 +1517,53 @@ function refreshSelectors() {
     if (allow3El) allow3El.parentElement.style.display = 'none';
 
     // Dynamic gap and panel layout logic
+    // Determine panel step and gap range based on glass mode
+    const glassMode = $('glassType')?.value || 'standard';
+    const selectedGap = +($('gapSize')?.value || 20);
+    // Set panel step: 0 for continuous widths in Standard mode, 25 mm for stock mode
+    PANEL_STEP = (glassMode === 'standard') ? 0 : 25;
+    // Determine whether mixed panel sizes are allowed
+    allowMix = (glassMode === 'standard') ? false : $('allowMixed').checked;
     // Gap allowances per specification
-    // Pool fences allow 10–60 mm gaps; balustrades allow 10–26 mm gaps
-    const gMin = 10, gMax = fence === 'pool' ? 50 : 26;
+    let gMin, gMax;
+    if (glassMode === 'standard') {
+      // In Standard mode, gap is fixed to the selected value
+      gMin = selectedGap;
+      gMax = selectedGap;
+    } else {
+      // Stock mode: balustrade gaps 10–26 mm; pool fence 10–60 mm
+      gMin = 10;
+      gMax = fence === 'pool' ? 60 : 26;
+    }
     layouts = []; sideLens = spans;
     let total = 0, panels = [], posts = 0, rails = 0, gasket = 0, handrailMeters = 0;
 
     function sd50Sym(run, minGap, maxGap, maxPanel) {
       let cnt = Math.ceil(run / maxPanel);
       while (cnt < 600) {
-        let pw = Math.min(maxPanel, Math.floor(run / cnt / 25) * 25);
+        // Continuous widths: derive panel width directly when panel step is zero and a single gap value is specified
+        if ((PANEL_STEP <= 0 || PANEL_STEP < 1) && Math.abs(minGap - maxGap) < 1e-9) {
+          const desiredGap = minGap;
+          let pw = (run - desiredGap * (cnt + 1)) / cnt;
+          if (pw >= 200) {
+            // Calculate spigots required and adjust panel width if necessary
+            let discs = Math.max(2, Math.ceil((pw - 2 * edge) / MAX_SPACING) + 1);
+            if (discs > MAX_DISCS_PER_PANEL) {
+              pw = edge * 2 + (MAX_DISCS_PER_PANEL - 1) * MAX_SPACING;
+              discs = MAX_DISCS_PER_PANEL;
+            }
+            const maxPanelWidth = edge * 2 + (discs - 1) * MAX_SPACING;
+            if (pw > maxPanelWidth) pw = maxPanelWidth;
+            const gap = (run - pw * cnt) / (cnt + 1);
+            if (gap >= minGap && gap <= maxGap) {
+              return { panelWidths: Array(cnt).fill(pw), gap, run };
+            }
+          }
+          cnt++;
+          continue;
+        }
+        // Stock sizes: iterate panel widths in increments of PANEL_STEP
+        let pw = Math.min(maxPanel, Math.floor(run / cnt / PANEL_STEP) * PANEL_STEP);
         while (pw >= 200) {
           let discs = Math.max(2, Math.ceil((pw - 2 * edge) / MAX_SPACING) + 1);
           if (discs > MAX_DISCS_PER_PANEL) {
@@ -1521,7 +1576,7 @@ function refreshSelectors() {
           if (gap >= minGap && gap <= maxGap) {
             return { panelWidths: Array(cnt).fill(pw), gap, run };
           }
-          pw -= 50;
+          pw -= PANEL_STEP;
         }
         cnt++;
       }
@@ -1530,8 +1585,9 @@ function refreshSelectors() {
     function sd50Mix(run, minGap, maxGap, maxPanel) {
       let cnt = Math.ceil(run / maxPanel);
       while (cnt < 600) {
-        for (let A = maxPanel; A >= 200; A -= 25) {
-          for (let B = A; B >= A - 200; B -= 25) {
+        const step = PANEL_STEP > 0 ? PANEL_STEP : 25;
+        for (let A = maxPanel; A >= 200; A -= step) {
+          for (let B = A; B >= Math.max(200, A - 200); B -= step) {
             for (let k = 1; k < cnt; k++) {
               let discsA = Math.max(2, Math.ceil((A - 2 * edge) / MAX_SPACING) + 1);
               let discsB = Math.max(2, Math.ceil((B - 2 * edge) / MAX_SPACING) + 1);
@@ -1556,12 +1612,34 @@ function refreshSelectors() {
       const gateAdjustedSym = (run, min, max, maxP) => {
         let cnt = Math.ceil(run / maxP);
         while (cnt < 600) {
-          let pw = Math.min(maxP, Math.floor(run / cnt / 50) * 50);
+          // Continuous widths: derive panel width when panel step is zero and fixed gap
+          if ((PANEL_STEP <= 0 || PANEL_STEP < 1) && Math.abs(min - max) < 1e-9) {
+            const desiredGap = min;
+            let pw = (run / cnt) - desiredGap; // cnt gaps total
+            if (pw >= 200) {
+              // Adjust for spigot constraints
+              let discs = Math.max(2, Math.ceil((pw - 2 * edge) / MAX_SPACING) + 1);
+              if (discs > MAX_DISCS_PER_PANEL) {
+                pw = edge * 2 + (MAX_DISCS_PER_PANEL - 1) * MAX_SPACING;
+                discs = MAX_DISCS_PER_PANEL;
+              }
+              const maxPanelWidth = edge * 2 + (discs - 1) * MAX_SPACING;
+              if (pw > maxPanelWidth) pw = maxPanelWidth;
+              const gap = (run - pw * cnt) / cnt;
+              if (gap >= min && gap <= max) {
+                return { panelWidths: Array(cnt).fill(pw), gap, run };
+              }
+            }
+            cnt++;
+            continue;
+          }
+          // Stock sizes: iterate widths in increments of PANEL_STEP (fallback to 50 mm step)
+          let step = PANEL_STEP > 0 ? PANEL_STEP : 50;
+          let pw = Math.min(maxP, Math.floor(run / cnt / step) * step);
           while (pw >= 200) {
-            // Modified gap calculation: cnt gaps instead of cnt+1 (gate replaces one gap)
             const gap = (run - pw * cnt) / cnt;
             if (gap >= min && gap <= max) return { panelWidths: Array(cnt).fill(pw), gap, run };
-            pw -= 50;
+            pw -= step;
           }
           cnt++;
         }
@@ -1571,11 +1649,11 @@ function refreshSelectors() {
       const gateAdjustedMix = (run, min, max, maxP) => {
         let cnt = Math.ceil(run / maxP);
         while (cnt < 600) {
-          for (let A = maxP; A >= 200; A -= 50) {
-            for (let B = A; B >= A - 200; B -= 50) {
+          const step = PANEL_STEP > 0 ? PANEL_STEP : 50;
+          for (let A = maxP; A >= 200; A -= step) {
+            for (let B = A; B >= Math.max(200, A - 200); B -= step) {
               for (let k = 1; k < cnt; k++) {
                 const tot = (cnt - k) * A + k * B;
-                // Modified gap calculation: cnt gaps instead of cnt+1
                 const gap = (run - tot) / cnt;
                 if (gap >= min && gap <= max) {
                   return { panelWidths: [...Array(cnt - k).fill(A), ...Array(k).fill(B)], gap, run };
@@ -1589,9 +1667,10 @@ function refreshSelectors() {
       };
 
       // First try the exact length
-      let bestLayout = allowMixed
+      const useMix = allowMixed && PANEL_STEP > 0;
+      let bestLayout = useMix
         ? (gateAdjustedMix(originalLen, minGap, maxGap, maxPanel) || gateAdjustedSym(originalLen, minGap, maxGap, maxPanel))
-        : (gateAdjustedSym(originalLen, minGap, maxGap, maxPanel) || gateAdjustedMix(originalLen, minGap, maxGap, maxPanel));
+        : gateAdjustedSym(originalLen, minGap, maxGap, maxPanel);
       
       if (bestLayout) {
         bestLayout.adjustedLength = originalLen;
@@ -1605,9 +1684,9 @@ function refreshSelectors() {
           const adjustedLen = originalLen + (direction * nudge);
           if (adjustedLen < 200) continue;
           
-          const layout = allowMixed
+          const layout = useMix
             ? (gateAdjustedMix(adjustedLen, minGap, maxGap, maxPanel) || gateAdjustedSym(adjustedLen, minGap, maxGap, maxPanel))
-            : (gateAdjustedSym(adjustedLen, minGap, maxGap, maxPanel) || gateAdjustedMix(adjustedLen, minGap, maxGap, maxPanel));
+            : gateAdjustedSym(adjustedLen, minGap, maxGap, maxPanel);
           
           if (layout) {
             if (!bestLayout || layout.panelWidths.length < bestLayout.panelWidths.length) {
@@ -1626,9 +1705,10 @@ function refreshSelectors() {
     // Enhanced solver with run length nudging for "unlucky" lengths
     function findBestLayout(originalLen, minGap, maxGap, maxPanel, allowMixed) {
       // First try the exact length
-      let bestLayout = allowMixed
+      const useMix = allowMixed && PANEL_STEP > 0;
+      let bestLayout = useMix
         ? (sd50Mix(originalLen, minGap, maxGap, maxPanel) || sd50Sym(originalLen, minGap, maxGap, maxPanel))
-        : (sd50Sym(originalLen, minGap, maxGap, maxPanel) || sd50Mix(originalLen, minGap, maxGap, maxPanel));
+        : sd50Sym(originalLen, minGap, maxGap, maxPanel);
       
       if (bestLayout) {
         bestLayout.adjustedLength = originalLen;
@@ -1643,9 +1723,9 @@ function refreshSelectors() {
           const adjustedLen = originalLen + (direction * nudge);
           if (adjustedLen < 200) continue; // Don't go below minimum reasonable length
           
-          const layout = allowMixed
+          const layout = useMix
             ? (sd50Mix(adjustedLen, minGap, maxGap, maxPanel) || sd50Sym(adjustedLen, minGap, maxGap, maxPanel))
-            : (sd50Sym(adjustedLen, minGap, maxGap, maxPanel) || sd50Mix(adjustedLen, minGap, maxGap, maxPanel));
+            : sd50Sym(adjustedLen, minGap, maxGap, maxPanel);
           
           if (layout) {
             // Prefer solutions with fewer panels (wider panels)
@@ -1900,10 +1980,14 @@ function refreshSelectors() {
     // Group panel sizes and show disc count per size
     const panelSummary = (() => {
       const m = {};
-      panels.forEach(w => m[w] = (m[w] || 0) + 1);
+      panels.forEach(w => {
+        const key = PANEL_STEP <= 0 ? (Math.round(w * 10) / 10).toFixed(1) : String(w);
+        m[key] = (m[key] || 0) + 1;
+      });
       return Object.entries(m)
         .map(([w, n]) => {
-          let spigs = Math.max(2, Math.ceil((w - 2 * edge) / MAX_SPACING) + 1);
+          const widthNum = parseFloat(w);
+          let spigs = Math.max(2, Math.ceil((widthNum - 2 * edge) / MAX_SPACING) + 1);
           return `${n} × @${w} mm (${spigs} spigots each)`;
         })
         .join('<br>');
@@ -2508,7 +2592,9 @@ function refreshSelectors() {
         r.setAttribute('stroke', '#333');
         svg.appendChild(r);
         const t = document.createElementNS(NS, 'text');
-        t.textContent = pw;
+        // Panel width label: round to one decimal in Standard mode
+        const dispPw = PANEL_STEP <= 0 ? (Math.round(pw * 10) / 10).toFixed(1) : pw;
+        t.textContent = dispPw;
         t.setAttribute('x', x + w / 2); t.setAttribute('y', 105);
         t.setAttribute('text-anchor', 'middle'); t.setAttribute('font-size', '12');
         t.setAttribute('font-weight', 'bold');
@@ -2622,7 +2708,9 @@ function refreshSelectors() {
         r.setAttribute('fill','#a8d6ff');r.setAttribute('stroke','#333');
         svg.appendChild(r);
         const t=document.createElementNS(NS,'text');
-        t.textContent=pw;
+        // Panel width label: round to one decimal in Standard mode
+        const dispPw2 = PANEL_STEP <= 0 ? (Math.round(pw * 10) / 10).toFixed(1) : pw;
+        t.textContent=dispPw2;
         t.setAttribute('x',x+w/2);t.setAttribute('y',105);
         t.setAttribute('text-anchor','middle');t.setAttribute('font-size','12');
         t.setAttribute('font-weight','bold');
@@ -3234,7 +3322,9 @@ panelsToProcess.forEach((pw, panelIndex) => {
 
   // Add panel measurement label
 const t = document.createElementNS(NS,'text');
-t.textContent = `${pw} mm`;
+// Panel measurement: round to one decimal in Standard mode
+const dispPw3 = PANEL_STEP <= 0 ? (Math.round(pw * 10) / 10).toFixed(1) : Math.round(pw);
+t.textContent = `${dispPw3} mm`;
 t.setAttribute('font-size', '25');           // Larger
 t.setAttribute('font-weight', 'bold');        // Bold
 t.setAttribute('fill', '#111');               // Black
@@ -3876,7 +3966,9 @@ svg.appendChild(overallLabel);
         
         // Panel length label with proper orientation
         const t = document.createElementNS(NS,'text');
-        t.textContent = `${Math.round(pw)} mm`;
+        // Panel length label: round to one decimal in Standard mode
+        const dispPw4 = PANEL_STEP <= 0 ? (Math.round(pw * 10) / 10).toFixed(1) : Math.round(pw);
+        t.textContent = `${dispPw4} mm`;
         t.setAttribute('font-size', String(PANEL_FONT));
         t.setAttribute('font-weight', 'bold');
         t.setAttribute('fill', 'rgb(20,80,160)');
@@ -6307,6 +6399,50 @@ saveDrawingState();
 
 // Initialize the viewBox for zoom functionality
 updateViewBox();
+
+  // ── Glass Mode / Gap size UI helpers ──
+  // Populate gap size options based on fence type and update UI visibility based on glass mode.
+  function updateGapOptions() {
+    const fenceVal = $('fenceType')?.value;
+    const gapSelect = $('gapSize');
+    if (!gapSelect) return;
+    // Clear existing options
+    gapSelect.innerHTML = '';
+    // Gap range: 10–26 mm for balustrade, 10–60 mm for pool fences
+    const minGap = 10;
+    const maxGap = (fenceVal === 'pool') ? 60 : 26;
+    for (let g = minGap; g <= maxGap; g++) {
+      const opt = document.createElement('option');
+      opt.value = g;
+      opt.textContent = g;
+      gapSelect.appendChild(opt);
+    }
+    // Default gap is 20 mm if present
+    if (gapSelect.querySelector('option[value="20"]')) {
+      gapSelect.value = '20';
+    }
+  }
+  function updateGlassModeUI() {
+    const mode = $('glassType')?.value || 'standard';
+    const gapDiv = $('gapSelectContainer');
+    const allowDiv = $('allowMixedContainer');
+    if (!gapDiv || !allowDiv) return;
+    if (mode === 'standard') {
+      gapDiv.style.display = '';
+      allowDiv.style.display = 'none';
+      updateGapOptions();
+    } else {
+      gapDiv.style.display = 'none';
+      allowDiv.style.display = '';
+    }
+  }
+  // Initialize gap options and UI on page load
+  document.addEventListener('DOMContentLoaded', () => {
+    updateGapOptions();
+    updateGlassModeUI();
+    $('fenceType')?.addEventListener('change', updateGapOptions);
+    $('glassType')?.addEventListener('change', updateGlassModeUI);
+  });
 
   </script>
 
